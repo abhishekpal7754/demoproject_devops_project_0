@@ -1,83 +1,145 @@
 pipeline {
-  agent any
+    agent any
 
-  options {
-    buildDiscarder(logRotator(numToKeepStr: '20'))
-    disableConcurrentBuilds()
-    timestamps()
-    timeout(time: 30, unit: 'MINUTES')
-  }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        disableConcurrentBuilds()
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+    }
 
-  environment {
-    IMAGE_REPOSITORY = 'devops7754/flask-app'
-    DOCKERHUB_CREDENTIALS = credentials('dockerhub-creds')
-    KUBECONFIG = credentials('kubernetes-kubeconfig')
-  }
+    environment {
+        IMAGE_REPOSITORY = "devops7754/flask-app"
+        IMAGE_TAG = "${BUILD_NUMBER}"
+        KUBECONFIG = "/var/lib/jenkins/.kube/config"
+    }
 
-  stages {
-    stage('Checkout') {
-      steps { checkout scm }
-    }
-    stage('Build Docker Image') {
-      steps {
-        sh 'docker build --pull --tag ${IMAGE_REPOSITORY}:${BUILD_NUMBER} application'
-      }
-    }
-    stage('Tag Image') {
-      steps { sh 'docker tag ${IMAGE_REPOSITORY}:${BUILD_NUMBER} ${IMAGE_REPOSITORY}:latest' }
-    }
-    stage('Push Image') {
-      steps {
-        sh '''
-          set +x
-          echo "$DOCKERHUB_CREDENTIALS_PSW" | docker login --username "$DOCKERHUB_CREDENTIALS_USR" --password-stdin
-          docker push "${IMAGE_REPOSITORY}:${BUILD_NUMBER}"
-          docker push "${IMAGE_REPOSITORY}:latest"
-          docker logout
-        '''
-      }
-    }
-    stage('Verify Kubernetes Cluster') {
-      steps { sh 'kubectl version --client && kubectl get nodes' }
-    }
-    stage('Deploy Application') {
-      steps {
-        sh '''
-          kubectl apply -f kubernetes/namespace.yaml
-          kubectl apply -f kubernetes/deployment.yaml
-          kubectl apply -f kubernetes/service.yaml
-        '''
-      }
-    }
-    stage('Rolling Update') {
-      steps {
-        sh '''
-          kubectl -n demo set image deployment/flask-app flask-app=${IMAGE_REPOSITORY}:${BUILD_NUMBER}
-          kubectl -n demo set env deployment/flask-app APP_VERSION=${BUILD_NUMBER}
-        '''
-      }
-    }
-    stage('Rollout Status') {
-      steps { sh 'kubectl -n demo rollout status deployment/flask-app --timeout=180s' }
-    }
-    stage('Verify Deployment') {
-      steps {
-        sh '''
-          kubectl -n demo get pods -o wide
-          kubectl -n demo get deployment flask-app
-          kubectl -n demo get service flask-app
-        '''
-      }
-    }
-  }
+    stages {
 
-  post {
-    unsuccessful {
-      sh 'kubectl -n demo rollout undo deployment/flask-app || true'
+        stage('Checkout Source Code') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Verify Workspace') {
+            steps {
+                sh '''
+                pwd
+                ls -lrt
+                '''
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh '''
+                docker build -t ${IMAGE_REPOSITORY}:${IMAGE_TAG} application/
+                docker tag ${IMAGE_REPOSITORY}:${IMAGE_TAG} ${IMAGE_REPOSITORY}:latest
+                '''
+            }
+        }
+
+        stage('Docker Login') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-creds',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    )
+                ]) {
+                    sh '''
+                    echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                    '''
+                }
+            }
+        }
+
+        stage('Push Docker Image') {
+            steps {
+                sh '''
+                docker push ${IMAGE_REPOSITORY}:${IMAGE_TAG}
+                docker push ${IMAGE_REPOSITORY}:latest
+                '''
+            }
+        }
+
+        stage('Verify Kubernetes Cluster') {
+            steps {
+                sh '''
+                export KUBECONFIG=${KUBECONFIG}
+
+                kubectl get nodes
+                kubectl get ns
+                '''
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                sh '''
+                export KUBECONFIG=${KUBECONFIG}
+
+                kubectl apply -f kubernetes/namespace.yaml
+                kubectl apply -f kubernetes/deployment.yaml
+                kubectl apply -f kubernetes/service.yaml
+                '''
+            }
+        }
+
+        stage('Rolling Update') {
+            steps {
+                sh '''
+                export KUBECONFIG=${KUBECONFIG}
+
+                kubectl -n demo set image deployment/flask-deployment \
+                flask=${IMAGE_REPOSITORY}:${IMAGE_TAG}
+
+                kubectl -n demo rollout status deployment/flask-deployment --timeout=180s
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                sh '''
+                export KUBECONFIG=${KUBECONFIG}
+
+                echo "========== Deployments =========="
+                kubectl get deployment -n demo
+
+                echo "========== Pods =========="
+                kubectl get pods -n demo -o wide
+
+                echo "========== Services =========="
+                kubectl get svc -n demo
+                '''
+            }
+        }
     }
-    always {
-      sh 'docker image rm ${IMAGE_REPOSITORY}:${BUILD_NUMBER} ${IMAGE_REPOSITORY}:latest 2>/dev/null || true'
-      cleanWs(deleteDirs: true, notFailBuild: true)
+
+    post {
+
+        success {
+            echo "CI/CD Pipeline Completed Successfully."
+        }
+
+        failure {
+            sh '''
+            export KUBECONFIG=${KUBECONFIG}
+            kubectl rollout undo deployment/flask-deployment -n demo || true
+            '''
+        }
+
+        always {
+            sh '''
+            docker logout || true
+
+            docker image rm ${IMAGE_REPOSITORY}:${IMAGE_TAG} || true
+            docker image rm ${IMAGE_REPOSITORY}:latest || true
+            '''
+            cleanWs()
+        }
     }
-  }
 }
